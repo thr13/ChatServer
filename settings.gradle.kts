@@ -3,3 +3,6 @@ plugins {
 }
 rootProject.name = "chat-server"
 
+include(
+    "chat-application"
+)
