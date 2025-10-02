@@ -80,7 +80,7 @@ class WebSocketSessionManager(
             redisMessageBroker.subscribeToRoom(roomId)
         }
 
-        logger.info("$serverId 의 $serverRoomKey 로 $roomId 채팅방에 참가하였습니다.")
+        logger.info("$userId 님이 $serverId 의 $serverRoomKey 로 $roomId 채팅방에 참가하였습니다.")
     }
 
     fun sendMessageToLocalRoom(roomId: Long, message: ChatMessage, excludeUserId: Long? = null) {
