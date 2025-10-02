@@ -10,7 +10,7 @@ import java.util.*
 @Repository
 interface ChatRoomMemberRepository : CrudRepository<ChatRoomMember, Long> {
 
-    fun findByChatRoomIdAndIsActiveTrue(chatRoomId: String): List<ChatRoomMember>
+    fun findByChatRoomIdAndIsActiveTrue(chatRoomId: Long): List<ChatRoomMember>
 
     fun findByChatRoomIdAndUserIdAndUserIdAndIsActiveTrue(chatRoomId: Long, userId: Long): Optional<ChatRoomMember>
 
