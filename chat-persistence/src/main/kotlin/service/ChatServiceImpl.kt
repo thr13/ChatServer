@@ -2,10 +2,12 @@ package service
 
 import dto.*
 import model.*
+import org.slf4j.LoggerFactory
 import org.springframework.cache.annotation.CacheEvict
 import org.springframework.cache.annotation.Cacheable
 import org.springframework.cache.annotation.Caching
 import org.springframework.data.domain.Page
+import org.springframework.data.domain.PageRequest
 import org.springframework.data.domain.Pageable
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
@@ -30,6 +32,8 @@ class ChatServiceImpl(
     private val messageSequenceService: MessageSequenceService,
     private val webSocketSessionManager: WebSocketSessionManager
 ) : ChatService {
+
+    private val logger = LoggerFactory.getLogger(ChatServiceImpl::class.java)
 
     //채팅방을 새롭게 생성시 기존에 남아있던 캐시 데이터 삭제 필요 => @CacheEvit 사용
     @CacheEvict(value = ["chatRooms"], allEntries = true)
@@ -132,24 +136,156 @@ class ChatServiceImpl(
         }
     }
 
+    //채팅방 탈퇴 => 채팅방의 상태 조율 => 논리적인 캐시 삭제 구현
+    @Caching(evict = [
+        CacheEvict(value = ["chatRoomMembers"], key = "#roomId"),
+    CacheEvict(value = ["chatRooms"], key = "#roomId")
+    ])
     override fun leaveChatRoom(roomId: Long, userId: Long) {
-        TODO("Not yet implemented")
+        chatRoomMemberRepository.leaveChatRoom(roomId, userId)
     }
 
+    @Cacheable(value = ["chatRoomMembers"], key = "#roomId")
     override fun getChatRoomMembers(roomId: Long): List<ChatRoomMemberDto> {
-        TODO("Not yet implemented")
+        return chatRoomMemberRepository.findByChatRoomIdAndIsActiveTrue(roomId)
+            .map { memberToDto(it) }
     }
 
-    override fun sendMessage(request: SendMessageRequest, senderId: Long): MessageDto {
-        TODO("Not yet implemented")
+    override fun sendMessage(
+        request: SendMessageRequest,
+        senderId: Long
+    ): MessageDto {
+
+        val chatRoom = chatRoomRepository.findById(request.chatRoomId)
+            .orElseThrow { IllegalArgumentException("채팅방을 찾을 수 없습니다: ${request.chatRoomId}") }
+
+        val sender = userRepository.findById(senderId)
+            .orElseThrow { IllegalArgumentException("사용자를 찾을 수 없습니다: $senderId") }
+
+        chatRoomMemberRepository.findByChatRoomIdAndUserIdAndUserIdAndIsActiveTrue(request.chatRoomId, senderId)
+            .orElseThrow { IllegalArgumentException("채팅방에 참여하지 않은 사용자입니다.") }
+
+        //메시지 순서 생성 => 채팅방별로 고유 시퀀스 부여
+        val sequenceNumber = messageSequenceService.getNextSequence(request.chatRoomId)
+        val message = Message(
+            content = request.content,
+            type = request.type ?: MessageType.TEXT,
+            chatRoom = chatRoom,
+            sender = sender,
+            sequenceNumber = sequenceNumber
+        )
+        //들어온 메시지 저장 => 메시지 저장이 웹소켓이므로 메시지를 전송한 세션이 로컬 세션이 된다
+        val savedMessage = messageRepository.save(message)
+        val chatMessage = ChatMessage(
+            id = savedMessage.id,
+            content = savedMessage.content ?: "",
+            type = savedMessage.type,
+            chatRoomId = savedMessage.chatRoom.id,
+            senderId = savedMessage.sender.id,
+            senderName = savedMessage.sender.displayName,
+            sequenceNumber = savedMessage.sequenceNumber,
+            timestamp = savedMessage.createdAt
+        )
+        //로컬 세션에 메시지를 즉시 전송 => 클라이언트 실시간 응답성 보장
+        webSocketSessionManager.sendMessageToLocalRoom(request.chatRoomId, chatMessage)
+
+        //현재 이 서버와 연결된 다른 서버들에게도 메시지 전달 필요 => 서버 인스턴스에 브로드캐스트 (자신 제외)
+        try {
+            redisMessageBroker.broadcastToRoom(
+                roomId = request.chatRoomId,
+                message = chatMessage,
+                excludeServerId = redisMessageBroker.getServerId()
+            )
+        } catch (e: Exception) {
+            logger.error("Failed to broadcast message via Redis: ${e.message}", e)
+        }
+
+        return messageToDto(savedMessage)
     }
 
-    override fun getMessages(roomId: Long, userId: Long, pageable: Pageable): Page<MessageDto> {
-        TODO("Not yet implemented")
+    //커서 기반 페이징 x => Pageable 의 첫번째, 두번째 페이지가 아닌 추가적으로 가져오는 데이터의 limit 이 동적인 값이므로 캐싱 처리 Xx
+    override fun getMessages(
+        roomId: Long,
+        userId: Long,
+        pageable: Pageable
+    ): Page<MessageDto> {
+        if (!chatRoomMemberRepository.existsByChatRoomIdAndUserIdAndIsActiveTrue(roomId, userId)) {
+            throw IllegalArgumentException("채팅방 멤버가 아닙니다.")
+        }
+
+        return messageRepository.findByChatRoomId(roomId, pageable)
+            .map { messageToDto(it) }
     }
 
+    /*
+        커서 기반 페이징
+        => 데이터를 가져오는 행위에 대해 쿼리의 WHERE 조건문에 값을 추가하면서 동작하는 것을 의미함
+        => [MySQL 튜닝 기법]
+            SELECT *
+            FROM chat_room_member
+            WHERE chat_room_id = :chatRoomId AND is_active = true
+            ORDER BY id
+            LIMIT 10 OFFSET 10;
+
+        위 쿼리는 정렬을 진행하고 그 이후에 데이터를 쪼개서 가져옴
+        => 정렬 자체는 한번 전체적으로 스캔하며 동작함
+        => 데이터가 많을 경우 인덱스를 탄다고 해도 느려질 것 이다
+
+            SELECT *
+            FROM chat_room_member
+            WHERE chat_room_id = :chatRoomId AND is_active = true AND id > :cursor
+            ORDER BY id ASC
+            LIMIT 10;
+
+        => 전체적으로 스캔을 하지 않고 정렬해야 데이터의 개수를 줄일 수 있다
+        => 기본적으로 WHERE 조건을 통해 탐색해야 하는 데이터의 개수를 줄인다
+        => 즉, 매칭되는 데이터가 많을수록 MySQL 엔진이 더 적은 데이터를 다룰 수 있다
+        => 이러한 관점에서 나온게 커서베이스의 페이징이다
+    */
     override fun getMessagesByCursor(request: MessagePageRequest, userId: Long): MessagePageResponse {
-        TODO("Not yet implemented")
+
+        if (!chatRoomMemberRepository.existsByChatRoomIdAndUserIdAndIsActiveTrue(request.chatRoomId, userId)) {
+            throw IllegalArgumentException("채팅방 멤버가 아닙니다")
+        }
+
+        val pageable = PageRequest.of(0, request.limit)
+
+        // 로컬 변수로 복사하여 스마트 캐스트 가능하게 함
+        val cursor = request.cursor
+
+        val messages = when {
+            // 커서가 없으면 최신 메시지부터 클라이언트에게 전달
+            cursor == null -> {
+                messageRepository.findLatestMessages(request.chatRoomId, pageable)
+            }
+            // 커서 이전 메시지들 (과거 방향)
+            request.direction == MessageDirection.BEFORE -> {
+                messageRepository.findMessagesBefore(request.chatRoomId, cursor, pageable)
+            }
+            // 커서 이후 메시지들 (최신 방향)
+            else -> {
+                messageRepository.findMessagesAfter(request.chatRoomId, cursor, pageable)
+                    .reversed()
+            }
+        }
+
+        val messageDtos = messages.map { messageToDto(it) }
+
+        // 다음,이전 커서
+        val nextCursor = if (messageDtos.isNotEmpty()) messageDtos.last().id else null
+        val prevCursor = if (messageDtos.isNotEmpty()) messageDtos.first().id else null
+
+        // 추가 데이터 존재 여부 확인
+        val hasNext = messages.size == request.limit
+        val hasPrev = cursor != null
+
+        return MessagePageResponse(
+            messages = messageDtos,
+            nextCursor = nextCursor,
+            prevCursor = prevCursor,
+            hasNext = hasNext,
+            hasPrev = hasPrev
+        )
     }
 
     @Cacheable(value = ["chatRooms"], key = "#chatRoom.id")
