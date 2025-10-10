@@ -72,13 +72,14 @@ class WebSocketSessionManager(
         val serverId = redisMessageBroker.getServerId()
         val serverRoomKey = "${serverRoomsKeyPrefix}$serverId"
 
-        redisTemplate.opsForSet().add(serverRoomKey, roomId.toString())
-
         val wasAlreadySubscribed = redisTemplate.opsForSet().isMember(serverRoomKey, roomId.toString()) == true
 
         if (!wasAlreadySubscribed) {
             redisMessageBroker.subscribeToRoom(roomId)
         }
+
+        redisTemplate.opsForSet().add(serverRoomKey, roomId.toString())
+
 
         logger.info("$userId 님이 $serverId 의 $serverRoomKey 로 $roomId 채팅방에 참가하였습니다.")
     }
